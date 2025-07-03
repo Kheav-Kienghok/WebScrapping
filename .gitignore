@@ -1,7 +1,8 @@
 __pycache__
 venv
 .txt
-!requirements.txt
 *.csv
 *.log
 .env
+outputs/
+aupp.edu.kh_page_urls.txt

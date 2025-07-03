@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from typing import List, Dict, Optional
 import aiohttp
+import httpx
 import asyncio
 import csv
 import re
@@ -11,6 +12,7 @@ from langdetect import detect, DetectorFactory
 from pathlib import Path
 from dotenv import load_dotenv
 import os
+import time
 
 load_dotenv()
 
@@ -43,11 +45,8 @@ class WebScraper:
 
         # Compile regex patterns for better performance
         self.whitespace_pattern = re.compile(r'\s+')
-        self.dash_pattern = re.compile(r'[\u2013\u2014\u2015\u2212-]+')
+        self.dash_pattern = re.compile(r'(?<=\d)[\u2013\u2014\u2015\u2212-](?=\d)')
         self.dot_pattern = re.compile(r'\.{2,}')
-
-        # Convert cookies to a string format for headers
-        cookie_str = "; ".join([f"{key}={value}" for key, value in self.cookies.items()])
 
         # Headers to mimic a real browser
         self.headers = {
@@ -138,9 +137,9 @@ class WebScraper:
 
         for element in soup.find_all(tags):
             raw_text = element.get_text(strip=True)
-            if not raw_text or len(raw_text) <= 10:
+            if not raw_text or len(raw_text) <= 5:
                 continue
-
+                
             cleaned_text = self.clean_text(raw_text)
             if not cleaned_text:
                 continue
@@ -155,19 +154,22 @@ class WebScraper:
             if re.search(r'[\u1780-\u17FF]', cleaned_text):
                 lang = "km"
 
+            if lang not in ("en", "km"):
+                lang = "en"
+
             # Append to appropriate list with alignment
             if lang == "en":
                 content['english_text'].append(cleaned_text)
             elif lang == "km":
                 content['khmer_text'].append(cleaned_text)
 
-
-    async def scrape_url(self, session: aiohttp.ClientSession, url: str) -> Optional[Dict[str, List[str]]]:
+        
+    async def scrape_url(self, client: httpx.AsyncClient, url: str) -> Optional[Dict[str, List[str]]]:
         """
-        Scrape content from a single URL with optimized processing (async)
+        Scrape content from a single URL using httpx with HTTP/2 enabled.
 
         Args:
-            session: aiohttp session for making requests
+            client: httpx.AsyncClient for making requests
             url: URL to scrape
 
         Returns:
@@ -176,35 +178,51 @@ class WebScraper:
         if not self.validate_url(url):
             logger.warning(f"Invalid URL: {url}")
             return None
-        
+
         try:
             logger.info(f"Scraping: {url}")
-            
-            async with session.get(url, headers=self.headers, cookies=self.cookies, timeout=self.timeout) as response:
-                if response.status != 200:
-                    logger.warning(f"HTTP {response.status} for {url}")
-                    return None
-                
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                
-                content = self.extract_content(soup)
-                content['url'] = url
-                content['status'] = 'success'
-                
-                # Add delay to be respectful
-                if self.delay > 0:
-                    await asyncio.sleep(self.delay)
-                
-                return content
-                
-        except asyncio.TimeoutError:
+
+            response = await client.get(url, timeout=self.timeout)
+            if response.status_code != 200:
+                logger.warning(f"HTTP {response.status_code} for {url}")
+                return None
+
+            html = response.text
+            soup = BeautifulSoup(html, 'html.parser')
+
+            content = self.extract_content(soup)
+            content['url'] = url
+            content['status'] = 'success'
+
+            if self.delay > 0:
+                await asyncio.sleep(self.delay)
+
+            return content
+
+        except httpx.TimeoutException:
             logger.error(f"Timeout scraping {url}")
         except Exception as e:
             logger.error(f"Error scraping {url}: {str(e)}")
-        
+
         return None
-        
+
+    async def scrape_multiple_urls(self, urls: List[str]) -> List[Dict]:
+        """
+        Scrape content from multiple URLs using httpx.AsyncClient with HTTP/2.
+
+        Args:
+            urls: List of URLs to scrape
+
+        Returns:
+            List of dictionaries with scraped content
+        """
+        limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+
+        async with httpx.AsyncClient(http2=True, headers=self.headers, cookies=self.cookies, limits=limits) as client:
+            tasks = [self.scrape_url(client, url) for url in urls]
+            results = await asyncio.gather(*tasks)
+            return [res for res in results if res]  # filter out None
+
     def extract_post_info_paragraph(self, soup: BeautifulSoup) -> str:
         """
         Extracts and formats post info as: 'Published on <date> in <category>'
@@ -262,21 +280,6 @@ class WebScraper:
 
         except Exception:
             return False
-
-    async def scrape_multiple_urls(self, urls: List[str]) -> List[Dict]:
-        """
-        Scrape content from multiple URLs with async processing
-
-        Args:
-            urls: List of URLs to scrape
-
-        Returns:
-            List of dictionaries with scraped content
-        """
-        async with aiohttp.ClientSession() as session:
-            tasks = [self.scrape_url(session, url) for url in urls]
-            results = await asyncio.gather(*tasks)
-            return [res for res in results if res]  # filter out None
         
     def save_to_csv(self, data: List[Dict], filename: Optional[str] = None, output_dir: str = "output") -> str:
         """
@@ -300,7 +303,7 @@ class WebScraper:
             filename = f"scraped_content_{timestamp}.csv"
 
         file_path = output_path / filename
-
+        
         try:
             with file_path.open(mode='w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=["ID", "English_Text", "Khmer_Text"])
@@ -308,23 +311,15 @@ class WebScraper:
                 
                 row_id = 1
                 for item in data:
-                    english_list = item.get("english_text", [])
-                    khmer_list = item.get("khmer_text", [])
 
-                    for text in english_list:
-                        writer.writerow({
-                            "ID": row_id,
-                            "English_Text": text,
-                            "Khmer_Text": ""
-                        })
+                    english_text = self.remove_duplicates_preserve_order(item.get("english_text", []))
+                    khmer_text = self.remove_duplicates_preserve_order(item.get("khmer_text", []))
+
+                    for text in english_text:
+                        writer.writerow({"ID": row_id, "English_Text": text, "Khmer_Text": ""})
                         row_id += 1
-
-                    for text in khmer_list:
-                        writer.writerow({
-                            "ID": row_id,
-                            "English_Text": "",
-                            "Khmer_Text": text
-                        })
+                    for text in khmer_text:
+                        writer.writerow({"ID": row_id, "English_Text": "", "Khmer_Text": text})
                         row_id += 1
 
             logger.info(f"Data successfully saved to {filename}")
@@ -332,6 +327,15 @@ class WebScraper:
             logger.error(f"Error saving to CSV: {e}")
 
         return str(file_path)
+
+    def remove_duplicates_preserve_order(self, items):
+        seen = set()
+        result = []
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
     
 
 async def main():
@@ -350,7 +354,7 @@ async def main():
     print("Enter URLs to scrape. Press Enter on an empty line to start scraping:")
 
     while True:
-        url_input = input("> ").strip()
+        url_input = input("  > ").strip()
         if not url_input:
             break  # Empty input ends the loop
 
@@ -363,11 +367,19 @@ async def main():
     if not urls:
         print("No valid URLs provided. Exiting.")
         return
+    
+    start_time = time.time()
+    print(f"Starting scraping {len(urls)} URLs...")
+
+    # Scrape all provided URLs
+    logger.info(f"Starting scraping {len(urls)} URLs at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     results = await scraper.scrape_multiple_urls(urls)
     scraper.save_to_csv(results, output_dir="outputs")
     print(f"Scraping completed. Results saved to 'outputs' directory.")
 
+    end_time = time.time()
+    print(f"Total time taken: {end_time - start_time:.2f} seconds")
 
 if __name__ == "__main__":
     asyncio.run(main())
