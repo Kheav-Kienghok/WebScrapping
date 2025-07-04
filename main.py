@@ -2,7 +2,6 @@ import logging
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from typing import List, Dict, Optional
-import aiohttp
 import httpx
 import asyncio
 import csv
@@ -125,6 +124,16 @@ class WebScraper:
 
         return content
 
+    def is_mostly_khmer(self, text: str, char_ratio: float = 0.4, min_khmer_chars: int = 10) -> bool:
+        khmer_chars = sum(1 for c in text if '\u1780' <= c <= '\u17FF')
+        total_chars = len(text)
+        if total_chars == 0:
+            return False
+        ratio = khmer_chars / total_chars
+        return khmer_chars >= min_khmer_chars and ratio >= char_ratio
+
+
+
     def extract_text_by_tags(self, soup: BeautifulSoup, tags: List[str], content: Dict[str, List[str]]):
         """
         Extract and classify text by tag (headings or paragraphs) and update content dict in-place.
@@ -145,17 +154,15 @@ class WebScraper:
                 continue
 
             # Attempt language detection
-            try:
-                lang = detect(cleaned_text)
-            except Exception:
-                lang = "unknown"
-
-            # Khmer script detection (Unicode range: U+1780 to U+17FF)
-            if re.search(r'[\u1780-\u17FF]', cleaned_text):
+            if self.is_mostly_khmer(cleaned_text):
                 lang = "km"
-
-            if lang not in ("en", "km"):
-                lang = "en"
+            else:
+                try:
+                    lang = detect(cleaned_text)
+                    if lang not in ("en", "km"):
+                        lang = "en"
+                except:
+                    lang = "unknown"
 
             # Append to appropriate list with alignment
             if lang == "en":
@@ -205,6 +212,11 @@ class WebScraper:
             logger.error(f"Error scraping {url}: {str(e)}")
 
         return None
+    
+    @staticmethod
+    async def scrape_limited(scraper, client, url, semaphore):
+        async with semaphore:
+            return await scraper.scrape_url(client, url)
 
     async def scrape_multiple_urls(self, urls: List[str]) -> List[Dict]:
         """
@@ -217,9 +229,10 @@ class WebScraper:
             List of dictionaries with scraped content
         """
         limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+        semaphore = asyncio.Semaphore(5)  # Limit concurrent requests to 5
 
         async with httpx.AsyncClient(http2=True, headers=self.headers, cookies=self.cookies, limits=limits) as client:
-            tasks = [self.scrape_url(client, url) for url in urls]
+            tasks = [WebScraper.scrape_limited(self, client, url, semaphore) for url in urls]
             results = await asyncio.gather(*tasks)
             return [res for res in results if res]  # filter out None
 
@@ -272,7 +285,7 @@ class WebScraper:
                 return False
 
             # Check if it's from the expected domain (optional)
-            if "aupp.edu.kh" not in parsed.netloc and "mfaic.gov.kh" not in parsed.netloc:
+            if "aupp.edu.kh" not in parsed.netloc:
                 logger.warning(f"URL {url} is not from expected domains")
                 # Don't return False here to allow other domains if needed
 
@@ -280,6 +293,7 @@ class WebScraper:
 
         except Exception:
             return False
+
         
     def save_to_csv(self, data: List[Dict], filename: Optional[str] = None, output_dir: str = "output") -> str:
         """
@@ -311,14 +325,10 @@ class WebScraper:
                 
                 row_id = 1
                 for item in data:
-
-                    english_text = self.remove_duplicates_preserve_order(item.get("english_text", []))
-                    khmer_text = self.remove_duplicates_preserve_order(item.get("khmer_text", []))
-
-                    for text in english_text:
+                    for text in item.get("english_text", []):
                         writer.writerow({"ID": row_id, "English_Text": text, "Khmer_Text": ""})
                         row_id += 1
-                    for text in khmer_text:
+                    for text in item.get("khmer_text", []):
                         writer.writerow({"ID": row_id, "English_Text": "", "Khmer_Text": text})
                         row_id += 1
 
@@ -328,15 +338,35 @@ class WebScraper:
 
         return str(file_path)
 
-    def remove_duplicates_preserve_order(self, items):
-        seen = set()
-        result = []
-        for item in items:
-            if item not in seen:
-                seen.add(item)
-                result.append(item)
-        return result
-    
+
+def remove_global_duplicates(results):
+    global_seen_en = set()
+    global_seen_km = set()
+    new_results = []
+
+    for item in results:
+        new_en = []
+        for text in item.get("english_text", []):
+            if text not in global_seen_en:
+                global_seen_en.add(text)
+                new_en.append(text)
+
+        new_km = []
+        for text in item.get("khmer_text", []):
+            if text not in global_seen_km:
+                global_seen_km.add(text)
+                new_km.append(text)
+
+        if new_en or new_km:
+            new_results.append({
+                "url": item.get("url", ""),
+                "status": item.get("status", ""),
+                "english_text": new_en,
+                "khmer_text": new_km,
+            })
+
+    return new_results
+
 
 async def main():
     scraper = WebScraper(delay=1.0, timeout=20)
@@ -375,6 +405,8 @@ async def main():
     logger.info(f"Starting scraping {len(urls)} URLs at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     results = await scraper.scrape_multiple_urls(urls)
+    results = remove_global_duplicates(results)  # Remove duplicates inside the text lists
+
     scraper.save_to_csv(results, output_dir="outputs")
     print(f"Scraping completed. Results saved to 'outputs' directory.")
 
