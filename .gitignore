@@ -6,3 +6,7 @@ venv
 .env
 outputs/
 aupp.edu.kh_page_urls.txt
+images/
+*.png
+*.jpg
+*.jpeg

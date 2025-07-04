@@ -7,10 +7,14 @@ certifi==2025.6.15
 charset-normalizer==3.4.2
 frozenlist==1.7.0
 greenlet==3.2.3
+httpx==0.25.2
 idna==3.10
+kaleido==0.2.1
 langdetect==1.0.9
 multidict==6.6.2
+pandas==2.1.4
 playwright==1.53.0
+plotly==5.17.0
 propcache==0.3.2
 pyee==13.0.0
 python-dotenv==1.1.1

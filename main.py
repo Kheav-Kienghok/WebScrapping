@@ -1,33 +1,62 @@
-import logging
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse
-from typing import List, Dict, Optional
-import httpx
+# Standard Library Imports
 import asyncio
 import csv
-import re
-from datetime import datetime
-from langdetect import detect, DetectorFactory
-from pathlib import Path
-from dotenv import load_dotenv
+import logging
 import os
+import re
 import time
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional
+from urllib.parse import urlparse
+
+# Third-Party Library Imports
+import httpx
+import pandas as pd
+import plotly.graph_objects as go
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from langdetect import detect, DetectorFactory
 
 load_dotenv()
 
 DetectorFactory.seed = 0  # Ensures consistent results
 
-# Set up logging for debugging and monitoring
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("scraper.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger(__name__)
+class RelevantLogsFilter(logging.Filter):
+    def filter(self, record):
+        # Always allow logs from your "scraper" logger
+        if record.name == "scraper":
+            return True
+        # Allow specific httpx logs that mention an HTTP request
+        if record.name.startswith("httpx") and "HTTP Request" in record.getMessage():
+            return True
+        # Block everything else
+        return False
 
+# Create handlers
+file_handler = logging.FileHandler("scraper.log", encoding="utf-8")
+stream_handler = logging.StreamHandler()
+
+# Apply filter
+relevant_filter = RelevantLogsFilter()
+file_handler.addFilter(relevant_filter)
+stream_handler.addFilter(relevant_filter)
+
+# Formatter
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+file_handler.setFormatter(formatter)
+stream_handler.setFormatter(formatter)
+
+# Configure root logger with both handlers
+logging.basicConfig(handlers=[file_handler, stream_handler], level=logging.INFO)
+
+# Your custom logger
+logger = logging.getLogger("scraper")
+logger.setLevel(logging.INFO)
+
+# Silence other noisy libraries at the source
+for noisy in ["kaleido", "plotly", "selenium", "urllib3"]:
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 class WebScraper:
     def __init__(self, delay: float = 1.0, timeout: int = 30, cookies: Optional[Dict[str, str]] = None):
@@ -116,11 +145,11 @@ class WebScraper:
             elif lang == "km" and post_info_text not in content['khmer_text']:
                 content['khmer_text'].append(post_info_text)
 
-        # Extract headings
+        # Extract text from main content areas
         self.extract_text_by_tags(soup, ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'], content)
-
-        # Extract paragraphs
         self.extract_text_by_tags(soup, ['p'], content)
+        self.extract_text_by_tags(soup, ['li'], content)
+        self.extract_text_by_tags(soup, ['th', 'td'], content)
 
         return content
 
@@ -131,7 +160,6 @@ class WebScraper:
             return False
         ratio = khmer_chars / total_chars
         return khmer_chars >= min_khmer_chars and ratio >= char_ratio
-
 
 
     def extract_text_by_tags(self, soup: BeautifulSoup, tags: List[str], content: Dict[str, List[str]]):
@@ -145,30 +173,152 @@ class WebScraper:
         """
 
         for element in soup.find_all(tags):
-            raw_text = element.get_text(strip=True)
-            if not raw_text or len(raw_text) <= 5:
-                continue
-                
-            cleaned_text = self.clean_text(raw_text)
-            if not cleaned_text:
-                continue
+            if element.name == 'td':
+                # Special handling for nested <tr> inside <td>
+                nested_trs = element.find_all('tr')
+                if nested_trs:
+                    for tr in nested_trs:
+                        self._process_text_block(tr.get_text(separator=' ', strip=True), content)
+                    continue  # skip processing outer <td> text again
+            self._process_text_block(element.get_text(separator=' ', strip=True), content)
 
-            # Attempt language detection
-            if self.is_mostly_khmer(cleaned_text):
-                lang = "km"
-            else:
-                try:
-                    lang = detect(cleaned_text)
-                    if lang not in ("en", "km"):
-                        lang = "en"
-                except:
-                    lang = "unknown"
+    def _process_text_block(self, raw_text: str, content: Dict[str, List[str]]):
+        """
+        Helper to clean, detect language, and append to content dictionary.
+        """
+        if not raw_text or len(raw_text) <= 5:
+            return
+        
+        cleaned_text = self.clean_text(raw_text)
+        if not cleaned_text:
+            return
 
-            # Append to appropriate list with alignment
-            if lang == "en":
-                content['english_text'].append(cleaned_text)
-            elif lang == "km":
-                content['khmer_text'].append(cleaned_text)
+        if self.is_mostly_khmer(cleaned_text):
+            lang = "km"
+        else:
+            try:
+                lang = detect(cleaned_text)
+                if lang not in ("en", "km"):
+                    lang = "en"
+            except:
+                lang = "unknown"
+
+        if lang == "en":
+            content['english_text'].append(cleaned_text)
+        elif lang == "km":
+            content['khmer_text'].append(cleaned_text)
+
+    def extract_tables_to_dataframes(self, soup: BeautifulSoup) -> List[Dict[str, pd.DataFrame]]:
+        """
+        Extracts tables with associated titles and subheadings from the HTML.
+        Returns a list of dicts: {'title': str, 'detail': Optional[str], 'data': DataFrame}
+        """
+        tables = soup.find_all("table")
+        extracted = []
+
+        # Get the first <p> in the document once
+        first_p = soup.find("p")
+        first_p_text = first_p.get_text(strip=True) if first_p else ""
+
+        for idx, table in enumerate(tables):
+            # Try to get a main title from heading or caption
+            title_tag = table.find_previous(lambda tag: (
+                tag.name in ["h1", "h2", "h3", "div", "button", "span"] and
+                ("Required" in tag.get_text() or "Courses" in tag.get_text())
+            ))
+            title = title_tag.get_text(strip=True) if title_tag else f"Table {idx+1}"
+
+            # Look for a detail/subheading from a nearby <p> or smaller tag
+            detail_tag = table.find_previous(lambda tag: tag.name in ["p", "small", "h4", "h5", "h6"] and tag != title_tag)
+            detail = detail_tag.get_text(strip=True) if detail_tag else None
+
+            # Extract headers and rows
+            headers = [th.get_text(strip=True) for th in table.find_all("th")]
+            rows = []
+            for tr in table.find_all("tr"):
+                cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+                if cells:
+                    rows.append(cells)
+
+            # Handle header-less tables
+            if not headers and rows:
+                col_count = max(len(row) for row in rows)
+                headers = [f"Column {i+1}" for i in range(col_count)]
+
+            if rows:
+                df = pd.DataFrame(rows, columns=headers)
+                extracted.append({
+                    "title": title,
+                    "detail": detail,
+                    "data": df
+                })
+
+        # Only modify the first table if it exists
+        if extracted:
+            extracted[0]["title"] = extracted[0]["detail"]
+            extracted[0]["detail"] = first_p_text
+
+        return extracted
+    
+    def save_plotly_table(self, df: pd.DataFrame, output_path: str, title: Optional[str] = None, detail: Optional[str] = None, first: bool = False):
+        row_count = len(df)
+        col_count = len(df.columns)
+
+        row_height = 30
+        col_width = 120
+        fig_height = 100 + row_count * row_height
+        fig_width = max(500, col_count * col_width)
+
+        if first and detail:
+            detail = detail.split(".")[0]  # Shorten detail to first sentence
+            split_detail = split_detail_text(detail)
+            title_texts = f"{title}<br><span style='font-size:12px;color:gray'>{split_detail}</span>"
+        else:
+            title_texts = title
+
+        fig = go.Figure(data=[go.Table(
+            header=dict(
+                values=list(df.columns),
+                fill_color='lightgrey',
+                align='left',
+                font=dict(size=12)
+            ),
+            cells=dict(
+                values=[df[col] for col in df.columns],
+                fill_color='white',
+                align='left',
+                font=dict(size=11),
+                height=row_height
+            )
+        )])
+
+        # Adjust top spacing based on whether detail is present
+        if first and detail:
+            top_margin = 120  # More space for title + subtitle
+            extra_height = 40
+        else:
+            top_margin = 60  # Small gap even without detail
+            extra_height = 20
+
+        fig.update_layout(
+            title=dict(
+                text=title_texts,
+                x=0.5,
+                xanchor='center',
+                font=dict(size=16)
+            ) if title else None,
+            autosize=False,
+            width=fig_width,
+            height=fig_height + extra_height,
+            margin=dict(l=20, r=20, t=top_margin, b=20)
+        )
+
+
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        if output_path.endswith(".png"):
+            fig.write_image(output_path, scale=2)
+            logger.info(f"Table saved to {output_path}")
 
         
     async def scrape_url(self, client: httpx.AsyncClient, url: str) -> Optional[Dict[str, List[str]]]:
@@ -201,6 +351,20 @@ class WebScraper:
             content['url'] = url
             content['status'] = 'success'
 
+            tables = self.extract_tables_to_dataframes(soup)
+            for i, item in enumerate(tables):
+
+                safe_title = safe_filename(tables[0]["title"])  # Always using tables[0]
+                output_path = f"images/{safe_title}_{i+1}.png"
+
+                self.save_plotly_table(
+                    df=item["data"],
+                    output_path=output_path,
+                    title=item["title"],
+                    detail=item["detail"] if i == 0 else None,
+                    first=(i == 0)  # only true for the first table
+                )
+            
             if self.delay > 0:
                 await asyncio.sleep(self.delay)
 
@@ -338,6 +502,11 @@ class WebScraper:
 
         return str(file_path)
 
+def safe_filename(text: str, max_length: int = 80) -> str:
+    text = re.sub(r"<.*?>", "", text)              # remove HTML tags
+    text = re.sub(r"[^\w\s-]", "", text)           # remove punctuation
+    text = re.sub(r"\s+", "_", text.strip())       # spaces to underscores
+    return text[:max_length]
 
 def remove_global_duplicates(results):
     global_seen_en = set()
@@ -367,6 +536,21 @@ def remove_global_duplicates(results):
 
     return new_results
 
+def split_detail_text(detail: str, max_length: int = 80) -> str:
+    words = detail.strip().split()
+    if len(words) <= 10:
+        return detail  # short enough, no need to break
+
+    # Try to break in half
+    mid = len(words) // 2
+    # Try to break at nearest punctuation after the midpoint
+    for i in range(mid, len(words)):
+        if words[i][-1] in ".,":
+            return " ".join(words[:i+1]) + "<br>" + " ".join(words[i+1:])
+
+    # If no good punctuation, just split in the middle
+    return " ".join(words[:mid]) + "<br>" + " ".join(words[mid:])
+
 
 async def main():
     scraper = WebScraper(delay=1.0, timeout=20)
@@ -381,11 +565,13 @@ async def main():
     scraper.cookies = cookies
 
     urls = []
-    print("Enter URLs to scrape. Press Enter on an empty line to start scraping:")
+    print("Enter URLs to scrape (e.g., https://www.aupp.edu.kh/harvard-law-professor-speaks-at-aupp/).")
+    print("Press Enter on an empty line to start scraping:\n")
 
     while True:
         url_input = input("  > ").strip()
         if not url_input:
+            print("\nStarting scraping...")
             break  # Empty input ends the loop
 
         if not scraper.validate_url(url_input):
