@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
 from urllib.parse import urlparse
+import functools
 
 # Third-Party Library Imports
 import httpx
@@ -149,7 +150,7 @@ class WebScraper:
         self.extract_text_by_tags(soup, ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'], content)
         self.extract_text_by_tags(soup, ['p'], content)
         self.extract_text_by_tags(soup, ['li'], content)
-        self.extract_text_by_tags(soup, ['th', 'td'], content)
+        # self.extract_text_by_tags(soup, ['th', 'td'], content)
 
         return content
 
@@ -226,6 +227,11 @@ class WebScraper:
                 tag.name in ["h1", "h2", "h3", "div", "button", "span"] and
                 ("Required" in tag.get_text() or "Courses" in tag.get_text())
             ))
+
+            # Fallback: If no keyword-matching title found, use the nearest <h1>
+            if not title_tag:
+                title_tag = table.find_previous("h1")
+            
             title = title_tag.get_text(strip=True) if title_tag else f"Table {idx+1}"
 
             # Look for a detail/subheading from a nearby <p> or smaller tag
@@ -255,9 +261,11 @@ class WebScraper:
 
         # Only modify the first table if it exists
         if extracted:
-            extracted[0]["title"] = extracted[0]["detail"]
-            extracted[0]["detail"] = first_p_text
-
+            title_lower = extracted[0]["title"].lower()
+            if "tuition fee" not in title_lower:
+                extracted[0]["title"] = extracted[0]["detail"]
+                extracted[0]["detail"] = first_p_text
+                
         return extracted
     
     def save_plotly_table(self, df: pd.DataFrame, output_path: str, title: Optional[str] = None, detail: Optional[str] = None, first: bool = False):
@@ -270,9 +278,14 @@ class WebScraper:
         fig_width = max(500, col_count * col_width)
 
         if first and detail:
-            detail = detail.split(".")[0]  # Shorten detail to first sentence
-            split_detail = split_detail_text(detail)
-            title_texts = f"{title}<br><span style='font-size:12px;color:gray'>{split_detail}</span>"
+
+            if len(detail) < 80:
+
+                if detail.count(".") > 1:
+                    split_detail = split_detail_text(detail)
+                    title_texts = f"{title}<br><span style='font-size:12px;color:gray'>{split_detail}</span>"
+            else:
+                title_texts = title[:80]  # Truncate title if too long
         else:
             title_texts = title
 
@@ -313,13 +326,11 @@ class WebScraper:
             margin=dict(l=20, r=20, t=top_margin, b=20)
         )
 
-
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
         if output_path.endswith(".png"):
             fig.write_image(output_path, scale=2)
             logger.info(f"Table saved to {output_path}")
-
         
     async def scrape_url(self, client: httpx.AsyncClient, url: str) -> Optional[Dict[str, List[str]]]:
         """
@@ -357,14 +368,34 @@ class WebScraper:
                 safe_title = safe_filename(tables[0]["title"])  # Always using tables[0]
                 output_path = f"images/{safe_title}_{i+1}.png"
 
-                self.save_plotly_table(
+                asyncio.create_task(self.save_plotly_table_async(
                     df=item["data"],
                     output_path=output_path,
                     title=item["title"],
                     detail=item["detail"] if i == 0 else None,
                     first=(i == 0)  # only true for the first table
-                )
-            
+                ))
+
+                # Add the header row first
+                header = [str(col) for col in item["data"].columns]
+                header_str = " | ".join(header)
+                header_str = self.clean_text(header_str)
+
+                if self.is_mostly_khmer(header_str):
+                    content.setdefault('khmer_text', []).append(header_str)
+                else:
+                    content.setdefault('english_text', []).append(header_str)
+
+                # Then add all rows
+                for table_row in item["data"].values.tolist():
+                    table_str = " | ".join(str(cell) for cell in table_row if cell)
+                    table_str = self.clean_text(table_str)
+
+                    if self.is_mostly_khmer(table_str):
+                        content.setdefault('khmer_text', []).append(table_str)
+                    else:
+                        content.setdefault('english_text', []).append(table_str)
+
             if self.delay > 0:
                 await asyncio.sleep(self.delay)
 
@@ -376,6 +407,12 @@ class WebScraper:
             logger.error(f"Error scraping {url}: {str(e)}")
 
         return None
+
+    async def save_plotly_table_async(self, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        # Runs the blocking save_plotly_table in a thread, non-blocking for event loop
+        func = functools.partial(self.save_plotly_table, *args, **kwargs)
+        await loop.run_in_executor(None, func)
     
     @staticmethod
     async def scrape_limited(scraper, client, url, semaphore):
